@@ -72,7 +72,7 @@ func GetOFName(reduceId int) string {
 }
 
 func doMap(mapf func(string, string) []KeyValue, task *MRTask) error {
-	log.Printf("Doing map task #%v-%v", task.CurTaskId, task.Filename)
+	//log.Printf("Doing map task #%v-%v", task.CurTaskId, task.Filename)
 	content, err := os.ReadFile(task.Filename)
 	if err != nil {
 		return err
@@ -85,23 +85,21 @@ func doMap(mapf func(string, string) []KeyValue, task *MRTask) error {
 		resultBucket[h] = append(resultBucket[h], kv)
 	}
 	for i := 0; i < task.NReduce; i++ {
-		b, ok := resultBucket[i]
-		if ok {
-			bin, err := json.Marshal(b)
-			if err != nil {
-				return err
-			}
-			err = os.WriteFile(getIFName(task.CurTaskId, i), bin, 0644)
-			if err != nil {
-				return err
-			}
+		b := resultBucket[i]
+		bin, err := json.Marshal(b)
+		if err != nil {
+			return err
+		}
+		err = os.WriteFile(getIFName(task.CurTaskId, i), bin, 0644)
+		if err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
 func doReduce(reducef func(string, []string) string, task *MRTask) error {
-	log.Printf("Doing reduce task #%v", task.CurTaskId)
+	//log.Printf("Doing reduce task #%v", task.CurTaskId)
 	// read all IFs and perform reduce
 	all := make(map[string][]string)
 	for i := 0; i < task.NMap; i++ {

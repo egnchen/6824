@@ -17,7 +17,8 @@ type Coordinator struct {
 	// Your definitions here.
 	mu         sync.Mutex
 	tasks      map[int]*MRTask
-	availTasks chan *MRTask
+	availTasks []*MRTask
+	cond       *sync.Cond
 	state      MRTaskType
 	nMap       int
 	nReduce    int
@@ -47,64 +48,80 @@ func (c *Coordinator) transitLocked() {
 				NMap:      c.nMap,
 				NReduce:   c.nReduce,
 			}
-			c.availTasks <- newTask
+			c.availTasks = append(c.availTasks, newTask)
 		}
 		c.state = TYPE_REDUCE
+		c.cond.Broadcast()
 	case TYPE_REDUCE:
 		// done
 		c.state = TYPE_NONE
 	}
 }
 
+func (c *Coordinator) rescheduleTimeoutTaskLoop() {
+	for {
+		c.mu.Lock()
+		nextTick := time.Now().Add(TASK_TIMEOUT)
+		if c.state == TYPE_NONE {
+			c.mu.Unlock()
+			return
+		}
+		// TODO optimize this with heap
+		for i, t := range c.tasks {
+			outTime := t.LastExecuteTime.Add(TASK_TIMEOUT)
+			if outTime.Before(nextTick) {
+				nextTick = outTime
+			}
+			if outTime.Before(time.Now()) {
+				log.Printf("rescheduling #%v", t.CurTaskId)
+				log.Printf("last execute time %v", t.LastExecuteTime)
+				log.Printf("now %v", time.Now())
+				delete(c.tasks, i)
+				c.availTasks = append(c.availTasks, t)
+				c.cond.Signal()
+				break
+			}
+		}
+		c.mu.Unlock()
+		time.Sleep(nextTick.Sub(time.Now()))
+	}
+}
+
 func (c *Coordinator) GetNewTask(args *GetNewTaskArgs, reply *GetNewTaskReply) error {
-	var newTask *MRTask = nil
-	reply.Valid = true
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	if args.CompleteTaskTyp != TYPE_NONE {
 		//log.Printf("Receiving complete type %v id %v", args.CompleteTaskTyp, args.CompleteTaskId)
 		task, ok := c.tasks[args.CompleteTaskId]
 		if ok {
 			delete(c.tasks, args.CompleteTaskId)
-			//log.Printf("tasks removed #%v", args.CompleteTaskId)
-			if !args.Ok {
-				// re-schedule this immediately
-				log.Printf("Rescheduling task type %v id %v", task.Typ, task.CurTaskId)
-				c.availTasks <- task
+			if args.Ok {
+				// determine if all current tasks are done
+				if len(c.tasks)+len(c.availTasks) == 0 {
+					c.transitLocked()
+				}
+			} else {
+				// reschedule this immediately
+				c.availTasks = append(c.availTasks, task)
+				c.cond.Signal()
 			}
 		} else {
 			// this means ack is received after timeout, ignore it
 			log.Printf("Warning: task #%v not found, ignored", args.CompleteTaskId)
 		}
 	}
-	// TODO optimize this with heap
-	for i, t := range c.tasks {
-		if t.LastExecuteTime.Add(TASK_TIMEOUT).Before(time.Now()) {
-			log.Printf("#%v last execute time %v now %v", t.CurTaskId, t.LastExecuteTime, time.Now())
-			c.availTasks <- t
-			delete(c.tasks, i)
-			log.Printf("tasks removed (timeout)#%v", i)
-			break
-		}
-	}
-	if len(c.tasks)+len(c.availTasks) == 0 {
-		c.transitLocked()
-	}
 	if c.state == TYPE_NONE {
 		reply.Valid = false
-	}
-	c.mu.Unlock()
-
-	// non-critical, possibly blocking
-	if reply.Valid && newTask == nil {
-		newTask, reply.Valid = <-c.availTasks
-	}
-	if reply.Valid {
-		//log.Printf("distributing task typ %v id %v", newTask.Typ, newTask.CurTaskId)
+	} else {
+		reply.Valid = true
+		for len(c.availTasks) == 0 {
+			c.cond.Wait()
+		}
+		newTask := c.availTasks[0]
+		c.availTasks = c.availTasks[1:]
 		newTask.LastExecuteTime = time.Now()
-		c.mu.Lock()
 		c.tasks[newTask.CurTaskId] = newTask
-		//log.Printf("Added id %v to tasks", newTask.CurTaskId)
-		c.mu.Unlock()
+		//log.Printf("distributing task typ %v id %v", newTask.Typ, newTask.CurTaskId)
 		reply.Task = *newTask
 	}
 	return nil
@@ -147,11 +164,13 @@ func (c *Coordinator) Done() bool {
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c := Coordinator{
 		tasks:      make(map[int]*MRTask),
-		availTasks: make(chan *MRTask, int(math.Max(float64(len(files)), float64(nReduce)))),
+		availTasks: make([]*MRTask, 0, int(math.Max(float64(len(files)), float64(nReduce)))),
 		state:      TYPE_MAP,
 		nMap:       len(files),
 		nReduce:    nReduce,
+		mu:         sync.Mutex{},
 	}
+	c.cond = sync.NewCond(&c.mu)
 
 	// Your code here.
 	// initialize the coordinator with map tasks
@@ -163,8 +182,9 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 			NReduce:   c.nReduce,
 			Filename:  f,
 		}
-		c.availTasks <- newTask
+		c.availTasks = append(c.availTasks, newTask)
 	}
+	go c.rescheduleTimeoutTaskLoop()
 	c.server()
 	return &c
 }
