@@ -1,17 +1,21 @@
 package mr
 
-import "fmt"
+import (
+	"bufio"
+	"encoding/json"
+	"fmt"
+	"os"
+)
 import "log"
 import "net/rpc"
 import "hash/fnv"
-
 
 //
 // Map functions return a slice of KeyValue.
 //
 type KeyValue struct {
-	Key   string
-	Value string
+	Key   string `json:"k"`
+	Value string `json:"v"`
 }
 
 //
@@ -24,41 +28,124 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-
 //
 // main/mrworker.go calls this function.
 //
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
-
+	lastCompletedTyp := TYPE_NONE
+	lastCompletedId := INVALID_TASK_ID
+	ok := true
 	// Your worker implementation here.
-
-	// uncomment to send the Example RPC to the coordinator.
-	// CallExample()
-
+	for {
+		reply := CallGetNewTask(lastCompletedTyp, lastCompletedId, ok)
+		lastCompletedTyp = reply.Task.Typ
+		lastCompletedId = reply.Task.CurTaskId
+		if reply.Valid {
+			if reply.Task.Typ == TYPE_MAP {
+				err := doMap(mapf, &reply.Task)
+				if err != nil {
+					log.Printf("Map task #%v failed: %v", reply.Task.CurTaskId, err)
+				}
+				ok = err == nil
+			} else if reply.Task.Typ == TYPE_REDUCE {
+				err := doReduce(reducef, &reply.Task)
+				if err != nil {
+					log.Printf("Reduce task #%v failed: %v", reply.Task.CurTaskId, err)
+				}
+				ok = err == nil
+			} else {
+				panic("invalid task type TYPE_NONE")
+			}
+		} else {
+			break
+		}
+	}
 }
 
-//
-// example function to show how to make an RPC call to the coordinator.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//
-func CallExample() {
+func getIFName(mapId int, reduceId int) string {
+	return fmt.Sprintf("mr-%v-%v.txt", mapId, reduceId)
+}
 
-	// declare an argument structure.
-	args := ExampleArgs{}
+func GetOFName(reduceId int) string {
+	return fmt.Sprintf("mr-out-%v.txt", reduceId)
+}
 
-	// fill in the argument(s).
-	args.X = 99
+func doMap(mapf func(string, string) []KeyValue, task *MRTask) error {
+	log.Printf("Doing map task #%v-%v", task.CurTaskId, task.Filename)
+	content, err := os.ReadFile(task.Filename)
+	if err != nil {
+		return err
+	}
+	result := mapf(task.Filename, string(content))
+	// distribute it
+	resultBucket := make(map[int][]KeyValue)
+	for _, kv := range result {
+		h := ihash(kv.Key) % task.NReduce
+		resultBucket[h] = append(resultBucket[h], kv)
+	}
+	for i := 0; i < task.NReduce; i++ {
+		b, ok := resultBucket[i]
+		if ok {
+			bin, err := json.Marshal(b)
+			if err != nil {
+				return err
+			}
+			err = os.WriteFile(getIFName(task.CurTaskId, i), bin, 0644)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
 
-	// declare a reply structure.
-	reply := ExampleReply{}
+func doReduce(reducef func(string, []string) string, task *MRTask) error {
+	log.Printf("Doing reduce task #%v", task.CurTaskId)
+	// read all IFs and perform reduce
+	all := make(map[string][]string)
+	for i := 0; i < task.NMap; i++ {
+		bin, err := os.ReadFile(getIFName(i, task.CurTaskId))
+		if err != nil {
+			return err
+		}
+		var content []KeyValue
+		if err := json.Unmarshal(bin, &content); err != nil {
+			return err
+		}
+		// no need for sorting, use hashmap instead
+		for _, kv := range content {
+			all[kv.Key] = append(all[kv.Key], kv.Value)
+		}
+	}
+	f, err := os.OpenFile(GetOFName(task.CurTaskId), os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
+	defer f.Close()
+	w := bufio.NewWriter(f)
+	if err != nil {
+		return err
+	}
+	for k, v := range all {
+		agg := reducef(k, v)
+		_, err := fmt.Fprintf(w, "%v %v\n", k, agg)
+		if err != nil {
+			return err
+		}
+	}
+	if err := w.Flush(); err != nil {
+		return err
+	}
+	return nil
+}
 
-	// send the RPC request, wait for the reply.
-	call("Coordinator.Example", &args, &reply)
-
-	// reply.Y should be 100.
-	fmt.Printf("reply.Y %v\n", reply.Y)
+func CallGetNewTask(completeTaskTyp MRTaskType, CompleteTaskId int, ok bool) GetNewTaskReply {
+	args := GetNewTaskArgs{
+		CompleteTaskTyp: completeTaskTyp,
+		CompleteTaskId:  CompleteTaskId,
+		Ok:              ok,
+	}
+	reply := GetNewTaskReply{}
+	call("Coordinator.GetNewTask", &args, &reply)
+	return reply
 }
 
 //
