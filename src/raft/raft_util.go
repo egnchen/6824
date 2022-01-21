@@ -67,25 +67,26 @@ func (rf *Raft) appendLogsLocked(prevLogIndex int, entries ...LogEntry) {
 		return
 	}
 	i := prevLogIndex
-	if Debug {
-		// find the first conflicting log entry
-		for ; i < len(rf.log); i++ {
-			if rf.log[i].Term != entries[i-prevLogIndex].Term {
-				if rf.log[i].Index <= rf.commitIndex {
-					// panic
-					fmt.Println("ERROR: overwriting committed entries")
-					fmt.Printf("Conflict: log[%v]=%v != %v\n", i, rf.log[i], entries[i-prevLogIndex])
-					fmt.Println(entries)
-					fmt.Println(rf.log[rf.commitIndex:])
-					panic("ERROR")
-				}
-				break
+	// find the first conflicting log entry
+	for ; i < len(rf.log) && i-prevLogIndex < len(entries); i++ {
+		if rf.log[i].Term != entries[i-prevLogIndex].Term {
+			if rf.log[i].Index <= rf.commitIndex {
+				// panic
+				fmt.Println("ERROR: overwriting committed entries")
+				fmt.Printf("Conflict: log[%v]=%v != %v\n", i, rf.log[i], entries[i-prevLogIndex])
+				fmt.Println(entries)
+				fmt.Println(rf.log[rf.commitIndex:])
+				panic("ERROR")
 			}
+			break
 		}
 	}
-	rf.log = rf.log[:i]
-	rf.log = append(rf.log, entries[i-prevLogIndex:]...)
-	rf.persist()
+	// delete & append only if conflict
+	if i-prevLogIndex < len(entries) {
+		rf.log = rf.log[:i]
+		rf.log = append(rf.log, entries[i-prevLogIndex:]...)
+		rf.persist()
+	}
 }
 
 func (rf *Raft) getLogAtIndexLocked(index int) *LogEntry {

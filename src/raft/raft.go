@@ -237,7 +237,6 @@ type AppendEntriesReply struct {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	DPrintf("%v AE from %v term=%v prev=%v/%v len(e)=%v lc=%v", rf.me, args.LeaderId,
 		args.Term, args.PrevLogTerm, args.PrevLogIndex, len(args.Entries), args.LeaderCommit)
-	reply.Success = true
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	// update term first
@@ -245,15 +244,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.updateTerm(args.Term)
 		rf.toFollower()
 	}
-	reply.Term = rf.term
 
+	reply.Term = rf.term
 	if args.Term < rf.term {
 		DPrintf("%v received AE term(%v) < %v", rf.me, args.Term, rf.term)
 		reply.Success = false
 		return
 	}
-	// check log entry @ prevLogIndex matches prevLogTerm
 	NotifyChan(rf.heartbeatChan)
+
+	// check log entry @ prevLogIndex matches prevLogTerm
 	entry := rf.getLogAtIndexLocked(args.PrevLogIndex)
 	if entry == nil && args.PrevLogIndex > 0 {
 		DPrintf("%v prevLogIndex(%v) too large", rf.me, args.PrevLogIndex)
@@ -276,6 +276,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	// if an existing entry conflicts with the new one, replace it & delete all that follows
 	rf.appendLogsLocked(args.PrevLogIndex, args.Entries...)
+	DPrintf("%v last log index @%v", rf.me, rf.getLastLogIndexLocked())
 	// set commitIndex to min(lastLogIndex, args.LeaderCommit)
 	newCommitIndex := rf.getLastLogIndexLocked()
 	if newCommitIndex > args.LeaderCommit {
@@ -285,6 +286,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.commitIndex = newCommitIndex
 		rf.commitCond.Signal()
 	}
+	reply.Success = true
 }
 
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
@@ -362,7 +364,7 @@ func (rf *Raft) Start(command interface{}) (index int, term int, isLeader bool) 
 		rf.nextIndex[rf.me] = entry.Index + 1
 		rf.matchIndex[rf.me] = entry.Index
 		DPrintf("%v received entry #%v", rf.me, entry.Index)
-		// TODO send AE to all peers
+		// TODO(2C) send AE to all peers
 		//for _, c := range rf.retryChan {
 		//	NotifyChan(c)
 		//}
@@ -383,14 +385,16 @@ func (rf *Raft) Start(command interface{}) (index int, term int, isLeader bool) 
 //
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	// TODO(2C) notify on all channels so that goroutines could exit
+	NotifyChan(rf.heartbeatChan)
+	for _, c := range rf.retryChan {
+		NotifyChan(c)
+	}
 	// broadcast on all Cond
 	rf.stateCond.Broadcast()
 	rf.commitCond.Broadcast()
-	// TODO notify on all channels
-	//NotifyChan(rf.heartbeatChan)
-	//for _, c := range rf.retryChan {
-	//	NotifyChan(c)
-	//}
 }
 
 func (rf *Raft) killed() bool {
@@ -509,6 +513,7 @@ func (rf *Raft) applyLoop() {
 			rf.commitCond.Wait()
 		}
 		if rf.killed() {
+			rf.mu.Unlock()
 			break
 		}
 		for ; rf.lastApplied < rf.commitIndex; rf.lastApplied++ {
@@ -574,7 +579,6 @@ func (rf *Raft) heartbeatLoop(serverId int) {
 			go rf.sendHeartbeat(serverId, &args)
 		}
 		rf.mu.Unlock()
-		// TODO(2B) wait for appendCond
 		t := time.NewTimer(rf.getHeartbeatTimeout())
 		select {
 		case <-t.C:
@@ -641,16 +645,16 @@ func (rf *Raft) sendHeartbeat(serverId int, args *AppendEntriesArgs) {
 			copy(matchIndexes, rf.matchIndex)
 			sort.Ints(matchIndexes)
 			N := matchIndexes[len(matchIndexes)/2]
-			//DPrintf("%v %v N=%v", rf.me, rf.matchIndex, N)
+			DPrintf("%v %v N=%v", rf.me, rf.matchIndex, N)
 			if N > rf.commitIndex {
 				entry := rf.getLogAtIndexLocked(N)
 				if entry.Term == rf.term {
 					rf.commitIndex = N
 					rf.commitCond.Signal()
-					// retry immediately to commit to all servers
-					for _, c := range rf.retryChan {
-						NotifyChan(c)
-					}
+					// TODO(2C) retry immediately to commit to all servers
+					//for _, c := range rf.retryChan {
+					//	NotifyChan(c)
+					//}
 				}
 			}
 		}
@@ -690,7 +694,6 @@ func (rf *Raft) tickerLoop() {
 //
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
-	// TODO initialization (2C).
 	rf := &Raft{
 		peers:     peers,
 		persister: persister,
