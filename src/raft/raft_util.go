@@ -39,14 +39,18 @@ func (rf *Raft) getState() RaftState {
 }
 
 func (rf *Raft) getLastLogIndexLocked() int {
-	return len(rf.log)
+	if len(rf.log) > 0 {
+		return rf.log[len(rf.log)-1].Index
+	} else {
+		return rf.snapshotIndex
+	}
 }
 
 func (rf *Raft) getLastLogTermLocked() int {
 	if len(rf.log) > 0 {
 		return rf.log[len(rf.log)-1].Term
 	} else {
-		return 0
+		return rf.snapshotTerm
 	}
 }
 
@@ -55,9 +59,10 @@ func (rf *Raft) getLogsStartingFromIndexLocked(index int) []LogEntry {
 		DPrintf("%v Warning: starting from index 0", rf.me)
 		index = 1
 	}
-	// TODO make a copy here to avoid data race, maybe better solution?
 	ret := make([]LogEntry, len(rf.log[index-1:]))
-	Assert(copy(ret, rf.log[index-1:]) == len(ret))
+	for i := index - 1; i < len(rf.log); i++ {
+		ret[i-index+1] = *rf.log[i]
+	}
 	return ret
 }
 
@@ -84,29 +89,46 @@ func (rf *Raft) appendLogsLocked(prevLogIndex int, entries ...LogEntry) {
 	// delete & append only if conflict
 	if i-prevLogIndex < len(entries) {
 		rf.log = rf.log[:i]
-		rf.log = append(rf.log, entries[i-prevLogIndex:]...)
+		// TODO maybe not GC-friendly
+		for _, v := range entries {
+			rf.log = append(rf.log, &v)
+		}
 		rf.persist()
 	}
 }
 
-func (rf *Raft) getLogAtIndexLocked(index int) *LogEntry {
-	if index <= 0 || index > len(rf.log) {
-		return nil
+// getLogOffsetOfIndexLocked returns the offset in log[] array
+// of the LogEntry with given index. -1 if not found.
+func (rf *Raft) getLogOffsetOfIndexLocked(index int) int {
+	if len(rf.log) == 0 {
+		return -1
 	}
-	return &rf.log[index-1]
+	offset := index - rf.snapshotIndex - 1
+	if offset < 0 || offset >= len(rf.log) {
+		return -1
+	}
+	return offset
+}
+
+func (rf *Raft) getLogOfIndexLocked(index int) *LogEntry {
+	offset := rf.getLogOffsetOfIndexLocked(index)
+	if offset == -1 {
+		return nil
+	} else {
+		return rf.log[offset]
+	}
 }
 
 func (rf *Raft) getFirstLogOfTermLocked(term int) *LogEntry {
-	if len(rf.log) == 0 {
-		return nil
-	}
-	if term == 0 || term > rf.getLastLogTermLocked() {
-		return nil
-	}
+	Assert(term >= rf.snapshotIndex && term <= rf.getLastLogIndexLocked())
 	idx := sort.Search(len(rf.log), func(i int) bool {
 		return rf.log[i].Term >= term
 	})
-	return &rf.log[idx]
+	if idx < len(rf.log) {
+		return rf.log[idx]
+	} else {
+		return nil
+	}
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {

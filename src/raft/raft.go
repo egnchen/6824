@@ -20,7 +20,6 @@ package raft
 import (
 	"6.824/labgob"
 	"bytes"
-	"fmt"
 	"sort"
 
 	//	"bytes"
@@ -81,27 +80,29 @@ type Raft struct {
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
 
-	// Your data here (2A, 2B, 2C).
-	// Look at the paper's Figure 2 for a description of what
-	// state a Raft server must maintain.
-	state     RaftState
-	stateCond *sync.Cond
-	term      int
-	votedFor  int
-	log       []LogEntry
+	// persistent state on all servers
+	state         RaftState
+	term          int
+	votedFor      int
+	snapshotIndex int
+	snapshotTerm  int
+	log           []*LogEntry // stored as pointers to be more GC-friendly
 
 	// volatile state on all servers
 	commitIndex int
 	lastApplied int
-	commitCond  *sync.Cond
-	applyCh     chan ApplyMsg
 
 	// volatile state on leader
 	nextIndex  []int
 	matchIndex []int
-	retryChan  []chan struct{}
-	// volatile state on follower
-	heartbeatChan chan struct{} // serve as a condition variable
+
+	// channels and cond vars
+	stateCond  *sync.Cond
+	commitCond *sync.Cond
+	applyCh    chan ApplyMsg
+
+	retryChan     []chan struct{} // serve as condition variable for broadcast
+	heartbeatChan chan struct{}   // serve as condition variable for signal
 }
 
 // return currentTerm and whether this server
@@ -132,9 +133,11 @@ func (rf *Raft) persist() {
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.term)
 	e.Encode(rf.votedFor)
+	e.Encode(rf.snapshotIndex)
+	e.Encode(rf.snapshotTerm)
 	e.Encode(len(rf.log))
 	for _, l := range rf.log {
-		e.Encode(l)
+		e.Encode(*l)
 	}
 	rf.persister.SaveRaftState(w.Bytes())
 }
@@ -155,25 +158,26 @@ func (rf *Raft) readPersist(data []byte) {
 	d := labgob.NewDecoder(r)
 	var term int
 	var votedFor int
+	var snapshotIndex int
+	var snapshotTerm int
 	var logLen int
-	var log []LogEntry
-	if d.Decode(&term) != nil ||
-		d.Decode(&votedFor) != nil {
-		panic("Cannot decode term / votedFor")
-	}
-	if d.Decode(&logLen) != nil {
-		panic("Cannot decode log length")
-	}
-	log = make([]LogEntry, logLen)
+	var log []*LogEntry
+	d.Decode(&term)
+	d.Decode(&votedFor)
+	d.Decode(snapshotIndex)
+	d.Decode(snapshotTerm)
+	d.Decode(logLen)
+	log = make([]*LogEntry, logLen)
 	for i := 0; i < logLen; i++ {
-		if d.Decode(&log[i]) != nil {
-			panic(fmt.Sprintf("Cannot decode log entry @ %v", i))
-		}
+		log[i] = &LogEntry{}
+		d.Decode(log[i])
 	}
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	rf.term = term
 	rf.votedFor = votedFor
+	rf.snapshotIndex = snapshotIndex
+	rf.snapshotTerm = snapshotTerm
 	rf.log = log
 }
 
@@ -254,7 +258,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	NotifyChan(rf.heartbeatChan)
 
 	// check log entry @ prevLogIndex matches prevLogTerm
-	entry := rf.getLogAtIndexLocked(args.PrevLogIndex)
+	entry := rf.getLogOfIndexLocked(args.PrevLogIndex)
 	if entry == nil && args.PrevLogIndex > 0 {
 		DPrintf("%v prevLogIndex(%v) too large", rf.me, args.PrevLogIndex)
 		reply.Success = false
@@ -387,7 +391,7 @@ func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	// TODO(2C) notify on all channels so that goroutines could exit
+	// notify on all channels so that goroutines could exit
 	NotifyChan(rf.heartbeatChan)
 	for _, c := range rf.retryChan {
 		NotifyChan(c)
@@ -517,7 +521,7 @@ func (rf *Raft) applyLoop() {
 			break
 		}
 		for ; rf.lastApplied < rf.commitIndex; rf.lastApplied++ {
-			entry := rf.getLogAtIndexLocked(rf.lastApplied + 1)
+			entry := rf.getLogOfIndexLocked(rf.lastApplied + 1)
 			msg := ApplyMsg{
 				CommandValid: true,
 				Command:      entry.Command,
@@ -560,7 +564,7 @@ func (rf *Raft) heartbeatLoop(serverId int) {
 			if rf.getLastLogIndexLocked() >= rf.nextIndex[serverId] {
 				entries = rf.getLogsStartingFromIndexLocked(rf.nextIndex[serverId])
 			}
-			prevEntry := rf.getLogAtIndexLocked(rf.nextIndex[serverId] - 1)
+			prevEntry := rf.getLogOfIndexLocked(rf.nextIndex[serverId] - 1)
 			prevLogIndex := 0
 			prevLogTerm := 0
 			if prevEntry != nil {
@@ -647,7 +651,7 @@ func (rf *Raft) sendHeartbeat(serverId int, args *AppendEntriesArgs) {
 			N := matchIndexes[len(matchIndexes)/2]
 			DPrintf("%v %v N=%v", rf.me, rf.matchIndex, N)
 			if N > rf.commitIndex {
-				entry := rf.getLogAtIndexLocked(N)
+				entry := rf.getLogOfIndexLocked(N)
 				if entry.Term == rf.term {
 					rf.commitIndex = N
 					rf.commitCond.Signal()
@@ -704,6 +708,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		//term:      0,
 		//votedFor:  INVALID_PEER_ID,
 		//log:         nil,
+		//snapshotIndex: 0,
+		//snapshotTerm: 0,
 		commitIndex: 0,
 		lastApplied: 0,
 		applyCh:     applyCh,
